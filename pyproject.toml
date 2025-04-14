@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minigpt"
+version = "0.0.1"
+description = "Your package description here"
+authors = [{ name = "David Fitzek", email = "david.fitzek@pm.me" }]
+license = { text = "MIT" }
+requires-python = ">= 3.10"
+dependencies = ["torch", "tiktoken", "ruff", "pytest", "transformers", "pytorch_lightning", "datasets", "wandb", "jupyter"]
+
+[project.urls]
+Repository = "https://github.com/davidfitzek/minigpt"
+
+# [project.optional-dependencies]
+# If you want to specify optional dependencies for development, testing, etc.
+# dev = ["ruff", "pytest"]
+
+# [project.scripts]
+# Specify any command-line scripts here if needed
+
+# [tool.setuptools]
+# package-dir = {"" = "src"}
+# packages = ["minigpt"]
+
+# [tool.setuptools.packages.find]
+# exclude = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"] 
+include = ["minigpt"]  # package names should match these glob patterns (["*"] by default)
+exclude = ["tests"]  # exclude packages matching these glob patterns (empty by default)
+
+[tool.pytest.ini_options]
+addopts = "--verbose"
+python_files = ["tests/*.py"]
+
+[tool.mypy]
+# General mypy configurations
+files = ["src/alpha"]
+
+[tool.mypy.optax]
+ignore_missing_imports = true
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+unfixable = ["F401"] # dont remove unused imports
+
+# problem with pygraphviz. resolved by:
+# CFLAGS=-I$(brew --prefix graphviz)/include LDFLAGS=-L$(brew --prefix graphviz)/lib pip --no-cache-dir install pygraphviz
+# might also work
+# pip3 install --global-option=build_ext --global-option="-I$(brew --prefix graphviz)/include" --global-option="-L$(brew --prefix graphviz)/lib" pygraphviz

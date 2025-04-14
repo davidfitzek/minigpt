@@ -172,3 +172,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+wandb/
+_backlog/
+directory_analysis_output/
+*.DS_Store
