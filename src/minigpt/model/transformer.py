@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 import math
 from typing import Optional
-
+from einops import rearrange, einsum
 from minigpt.model.abstract_decoder import AbstractDecoder
 from minigpt.config import GPTConfig
 
@@ -22,7 +22,7 @@ class MultiHeadAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
         self.n_head = config.n_heads
-        self.n_embd = config.emb_dim
+        self.emb_dim = config.emb_dim
         self.dropout = config.dropout
         self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention")
         if not self.flash:
@@ -30,6 +30,7 @@ class MultiHeadAttention(nn.Module):
                 "WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0"
             )
             # causal mask to ensure that attention is only applied to the left in the input sequence
+            # makes this tensor a persistent part of the model but not a parameter (it won't be updated during training)
             self.register_buffer(
                 "bias",
                 torch.tril(torch.ones(config.block_size, config.block_size)).view(
@@ -37,21 +38,21 @@ class MultiHeadAttention(nn.Module):
                 ),
             )
 
-    # TODO replace transpose with rearrange operations.
     def forward(self, x: torch.Tensor):
-        # batch size, sequence length, embedding dimensionality (n_embd)
-        B, T, C = x.size()
+        # batch size, sequence length, embedding dimensionality (emb_dim)
+        b, s, emb_dim = x.size()
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        # (B, nh, T, hs)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
-        # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        # batch size, sequence length, embedding dimensionality (emb_dim)
+        q, k, v = self.c_attn(x).split(self.emb_dim, dim=2)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # d: head_dim = emb_dim // self.n_head
+        # h: n_heads
+        k = rearrange(k, "b s (h d) -> b h s d", h=self.n_head)
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.n_head)
+        v = rearrange(v, "b s (h d) -> b h s d", h=self.n_head)
+
+        # causal self-attention; Self-attend: (b, h, s, d) x (b, h, d, s) -> (b, h, s, s)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
@@ -64,16 +65,16 @@ class MultiHeadAttention(nn.Module):
             )
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
+            att = einsum("b h s d, b h t d -> b h s t", q, k) * (
+                1.0 / math.sqrt(k.size(-1))
+            )
+            # (b, h, s, s)
+            att = att.masked_fill(self.bias[:, :, :s, :s] == 0, float("-inf"))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = (
-            y.transpose(1, 2).contiguous().view(B, T, C)
-        )  # re-assemble all head outputs side by side
-
-        # output projection
+            y = torch.einsum("b h s t, b h t d -> b h s d", att, v)
+        y = rearrange(y, "b h s d -> b s (h d)")
+        # h * d = emb dim
         y = self.resid_dropout(self.c_proj(y))
         return y
 
@@ -173,7 +174,6 @@ class GPTModel(AbstractDecoder):
                 x[:, [-1], :]
             )  # note: using list [-1] to preserve the time dim
             loss = None
-        # logits = self.out_head(x)
         return logits, loss
 
     @torch.no_grad()
@@ -187,7 +187,6 @@ class GPTModel(AbstractDecoder):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
         for _ in range(max_new_tokens):
             # Crop current context if it exceeds the supported context size
