@@ -3,7 +3,7 @@ import torch.nn as nn
 from abc import ABC, abstractmethod
 
 
-class AbstractModel(nn.Module, ABC):
+class AbstractDecoder(nn.Module, ABC):
     """Abstract base class for language models."""
 
     def __init__(self):

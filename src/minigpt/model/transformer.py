@@ -3,7 +3,7 @@ import torch.nn as nn
 import math
 from torch.nn import functional as F
 
-from minigpt.model.abstract_model import AbstractModel
+from minigpt.model.abstract_decoder import AbstractDecoder
 
 
 # TODO understand precisely whats going on in the code!!!!
@@ -132,7 +132,7 @@ class TransformerBlock(nn.Module):
         return x
 
 
-class GPTModel(AbstractModel):
+class GPTModel(AbstractDecoder):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -147,8 +147,7 @@ class GPTModel(AbstractModel):
         self.final_norm = LayerNorm(config.emb_dim)
         self.out_head = nn.Linear(config.emb_dim, config.vocab_size, bias=False)
         # https://paperswithcode.com/method/weight-tying
-        self.tok_emb.weight = self.out_head.weight 
-
+        self.tok_emb.weight = self.out_head.weight
 
     def forward(self, input_ids, labels=None):
         batch_size, seq_len = input_ids.shape
