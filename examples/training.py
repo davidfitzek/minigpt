@@ -11,8 +11,7 @@ from minigpt.loggers import WandbLogger
 from minigpt.callbacks import ModelCheckpoint
 
 
-def main(
-    config: MinigptConfig):
+def main(config: MinigptConfig):
     # Setup
     torch.manual_seed(config.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -59,7 +58,7 @@ def main(
         save_freq="epoch",  # Save at the end of each epoch
         every_n_epochs=1,  # Save every epoch
         save_best_only=True,  # Only save when the model improves
-        monitor="val_loss",  
+        monitor="val_loss",
         mode="min",  # Lower is better for loss
         verbose=True,  # Print info when saving
     )

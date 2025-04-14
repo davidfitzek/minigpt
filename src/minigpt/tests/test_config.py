@@ -80,13 +80,11 @@ def test_minigpt_config():
         assert restored_config.training.learning_rate == 0.001
 
 
-
 def test_default_config():
     """Test the predefined DEFAULT_CONFIG."""
     assert isinstance(DEFAULT_CONFIG, MinigptConfig)
     assert DEFAULT_CONFIG.model.vocab_size == 50257
     assert DEFAULT_CONFIG.model.n_layers == 12
-
 
 
 if __name__ == "__main__":
