@@ -1,8 +1,8 @@
-from typing import Any, Optional
-import torch
 import os
-from minigpt.loggers import WandbLogger
+import torch
+from typing import Any, Optional
 from minigpt.callbacks.abstract_callback import Callback
+from minigpt.loggers import WandbLogger
 
 
 class ModelCheckpoint(Callback):
@@ -49,7 +49,7 @@ class ModelCheckpoint(Callback):
             filepath += ".pth"
 
         # Save model state dict
-        torch.save(trainer.model.state_dict(), filepath)
+        torch.save(trainer.lightning_module.model.state_dict(), filepath)
 
         # Log model artifact if using wandb
         if isinstance(trainer.logger, WandbLogger) and trainer.logger.log_model:
@@ -84,25 +84,50 @@ class ModelCheckpoint(Callback):
                     self.best_value = current
                     self._save_checkpoint(trainer, epoch)
 
-    def on_step_end(self, trainer: Any, step: int, loss: float) -> None:
+    def on_batch_end(self, trainer: Any, batch_idx: int, loss: float) -> None:
         """Save model at the end of step if conditions are met."""
         if self.save_freq == "step" and self.every_n_steps is not None:
-            if step % self.every_n_steps == 0:
+            if (
+                trainer.global_step > 0
+                and trainer.global_step % self.every_n_steps == 0
+            ):
                 # Calculate current epoch
+                epoch = trainer.global_step // len(trainer.train_loader)
+
+                # For step-based saving, we might not need to check best only
+                if not self.save_best_only:
+                    self._save_checkpoint(trainer, epoch)
+
+    def on_validation_end(
+        self, trainer: Any, train_loss: float, val_loss: float
+    ) -> None:
+        """Check for best model after validation if save_best_only is True."""
+        if self.save_freq == "step" and self.save_best_only:
+            # Get current value to monitor
+            current = val_loss if self.monitor == "val_loss" else train_loss
+
+            # Check if current value is better than best value
+            is_better = (self.mode == "min" and current < self.best_value) or (
+                self.mode == "max" and current > self.best_value
+            )
+
+            if is_better:
+                if self.verbose:
+                    print(
+                        f"Val loss improved from {self.best_value:.4f} to {current:.4f}"
+                    )
+                self.best_value = current
                 epoch = trainer.global_step // len(trainer.train_loader)
                 self._save_checkpoint(trainer, epoch)
 
     def on_fit_end(self, trainer: Any) -> None:
         """Save last model checkpoint if save_last is True."""
         if self.save_last:
-            # Calculate current epoch
-            # epoch = trainer.global_step // len(trainer.train_loader)
-
             # Create last checkpoint filename
             filepath = os.path.join(self.dirpath, "model_last.pth")
 
             # Save model state dict
-            torch.save(trainer.model.state_dict(), filepath)
+            torch.save(trainer.lightning_module.model.state_dict(), filepath)
 
             # Log model artifact if using wandb
             if isinstance(trainer.logger, WandbLogger) and trainer.logger.log_model:

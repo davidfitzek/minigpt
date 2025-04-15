@@ -1,37 +1,40 @@
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
+from typing import List, Optional, Any
 
-from minigpt.utils.generation_utils import generate_sample
 from minigpt.loggers import WandbLogger
+from minigpt.callbacks import Callback
 
 
 class Trainer:
     def __init__(
         self,
-        model,
-        train_loader,
-        val_loader,
-        optimizer,
-        device,
-        config,
-        tokenizer,
-        logger=None,
-        callbacks=None,
+        lightning_module,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        device: torch.device,
+        config: Any,
+        logger: Optional[Any] = None,
+        callbacks: Optional[List[Callback]] = None,
     ):
-        self.model = model.to(device)
+        self.lightning_module = lightning_module.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.optimizer = optimizer
+        self.optimizer = lightning_module.configure_optimizers()
         self.device = device
         self.config = config
-        self.tokenizer = tokenizer
         self.logger = logger
-        self.callbacks = callbacks or []  # Initialize callbacks list
+        self.callbacks = callbacks or []
 
         # Initialize tracking variables
         self.tokens_seen = 0
         self.global_step = -1
+        self.val_losses = []
+        self.train_losses = []
+
+        # For tracking running training loss
+        self.current_epoch_losses = []
 
         # Log hyperparameters if logger exists
         if self.logger:
@@ -46,11 +49,14 @@ class Trainer:
             # Watch model gradients
             if hasattr(self.logger, "watch"):
                 self.logger.watch(
-                    self.model, log="all", log_freq=config.training.wandb_log_freq
+                    self.lightning_module.model,
+                    log="all",
+                    log_freq=config.training.wandb_log_freq,
                 )
 
     # Main training loop
     def fit(self):
+        """Main training method that orchestrates the entire training process"""
         # Setup phase
         self._call_callbacks("on_fit_start")
 
@@ -67,44 +73,72 @@ class Trainer:
 
     # Training epoch
     def _train_epoch(self, epoch: int):
-        self.model.train()
-        for batch_idx, (inputs, targets) in enumerate(tqdm(self.train_loader)):
+        """Handle training for one epoch"""
+        self.lightning_module.train()
+        self.current_epoch_losses = []  # Reset epoch losses
+
+        for batch_idx, batch in enumerate(tqdm(self.train_loader)):
             if self._should_skip_batch(batch_idx):
                 continue
 
             self._call_callbacks("on_batch_start", batch_idx=batch_idx)
-            batch_loss = self._training_step(inputs, targets)
+            batch_loss = self._training_step(batch)
             self._call_callbacks("on_batch_end", batch_idx=batch_idx, loss=batch_loss)
 
-            # Evaluation
+            # Validation
             if self._should_validate():
                 self._validation_epoch(epoch)
 
-    def _training_step(self, inputs: torch.Tensor, targets: torch.Tensor):
-        _, loss = self.model(inputs, targets)
+        # At the end of the epoch, calculate and store average loss
+        if self.current_epoch_losses:
+            avg_train_loss = sum(self.current_epoch_losses) / len(
+                self.current_epoch_losses
+            )
+            self.train_losses.append(avg_train_loss)
+
+    def _training_step(self, batch: torch.Tensor):
+        """Process a single training batch"""
+        # Get the loss from the lightning module, passing the batch index
+        batch_idx = self.global_step + 1  # Next step index
+        loss = self.lightning_module.training_step(batch, batch_idx)
 
         # Optimization
         loss.backward()
         self.optimizer.step()
         self.optimizer.zero_grad()
 
-        # Update tracking
-        self.tokens_seen += inputs.numel()
+        # Update global step
         self.global_step += 1
 
-        # Log metrics
-        self._log_training_metrics(loss)
+        # Track batch loss for epoch average
+        loss_value = loss.item()
+        self.current_epoch_losses.append(loss_value)
 
-        return loss.item()
+        # Process and log metrics
+        self._process_logged_metrics()
+
+        return loss_value
 
     def _validation_epoch(self, epoch: int):
-        self.model.eval()
-        train_loss = self._validation_loop(self.train_loader)
-        val_loss = self._validation_loop(self.val_loader)
-        self.model.train()
+        """Run validation and log metrics"""
+        self.lightning_module.eval()
 
-        # Log and track
-        self._log_validation_metrics(train_loss, val_loss, epoch)
+        # Only validate on the validation dataset
+        val_loss = self._validation_loop(self.val_loader)
+        self.val_losses.append(val_loss)
+
+        # Get the average training loss from the current epoch
+        avg_train_loss = 0.0
+        if self.current_epoch_losses:
+            avg_train_loss = sum(self.current_epoch_losses) / len(
+                self.current_epoch_losses
+            )
+
+        # Process any metrics logged during validation
+        self._process_logged_metrics()
+
+        # Set model back to training mode
+        self.lightning_module.train()
 
         # Optional text generation
         if self.config.training.generate_samples:
@@ -112,91 +146,84 @@ class Trainer:
 
         # Notify callbacks
         self._call_callbacks(
-            "on_validation_end", train_loss=train_loss, val_loss=val_loss
+            "on_validation_end", train_loss=avg_train_loss, val_loss=val_loss
         )
 
     def _validation_loop(self, dataloader: DataLoader):
+        """Run validation on the given dataloader"""
         losses = []
         num_batches = min(self.config.training.eval_iter, len(dataloader))
 
         with torch.no_grad():
-            for i, (inputs, targets) in enumerate(dataloader):
+            for i, batch in enumerate(dataloader):
                 if i >= num_batches:
                     break
-                _, loss = self.model(inputs, targets)
+
+                # Run validation step
+                loss = self.lightning_module.validation_step(batch, i)
                 losses.append(loss.item())
+                self._process_logged_metrics()
+
+        # Notify the lightning module that validation is complete
+        if hasattr(self.lightning_module, "on_validation_epoch_end"):
+            self.lightning_module.on_validation_epoch_end()
+            # Process any metrics logged during the end hook
+            self._process_logged_metrics()
 
         return sum(losses) / len(losses) if losses else float("nan")
 
     # Helper methods
     def _should_skip_batch(self, batch_idx: int):
+        """Check if batch should be skipped (for overfit mode)"""
         return (
             self.config.training.overfit_batches > 0
             and batch_idx >= self.config.training.overfit_batches
         )
 
     def _should_validate(self):
+        """Check if validation should be performed"""
         return self.global_step % self.config.training.eval_freq == 0
 
     def _call_callbacks(self, hook_name, **kwargs):
+        """Call the specified hook on all callbacks"""
         for callback in self.callbacks:
             if hasattr(callback, hook_name):
                 getattr(callback, hook_name)(self, **kwargs)
 
-    # Logging methods
-    def _log_training_metrics(self, loss):
+    def _process_logged_metrics(self):
+        """Process and log metrics from the lightning module"""
+        # Early return if no logger or no metrics
         if not self.logger:
             return
 
-        # Perplexity is a measurement of how well a language model predicts a sample of text.
-        # Lower perplexity means better predictions:
-        # - A perplexity of 1 means the model perfectly predicts each token
-        # - A perplexity of the vocabulary size means the model is essentially random guessing
-        # - For natural language, good models achieve perplexity in the range of 10-60 depending on task
-        # Perplexity can be interpreted as the weighted average number of choices the model is "confused" by when predicting the next token.
-        perplexity = torch.exp(loss)
-        self.logger.log_metrics(
-            {
-                "train_loss_step": loss.item(),
-                "perplexity": perplexity.item(),
-                "tokens_seen": self.tokens_seen,
-                "global_step": self.global_step,
-            },
-            step=self.global_step,
+        metrics = self.lightning_module.get_logged_metrics()
+        if not metrics:
+            return
+
+        # Start with common metrics
+        metrics_to_log = {"global_step": self.global_step}
+
+        # Extract values for metrics that should be logged
+        metrics_to_log.update(
+            {name: info["value"] for name, info in metrics.items() if info["logger"]}
         )
 
-    def _log_validation_metrics(self, train_loss: float, val_loss: float, epoch: int):
-        if not self.logger:
-            return
-
-        metrics = {
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "epoch": epoch + 1,
-            "global_step": self.global_step,
-            "tokens_seen": self.tokens_seen,
-        }
-
-        self.logger.log_metrics(metrics, step=self.global_step)
+        # Log metrics and reset
+        self.logger.log_metrics(metrics_to_log, step=self.global_step)
+        self.lightning_module.reset_logged_metrics()
 
     def _generate_samples(self):
-        if (
-            not hasattr(self.config.training, "start_context")
-            or not self.config.training.start_context
-        ):
-            return
+        """Generate and log text samples from the model"""
+        generated_text = self.lightning_module.generate(self.device)
 
-        generated_text = generate_sample(
-            self.model, self.tokenizer, self.device, self.config.training.start_context
-        )
-
-        if self.logger and isinstance(self.logger, WandbLogger):
+        if generated_text and self.logger and isinstance(self.logger, WandbLogger):
             from wandb import Html
 
+            context = self.config.training.start_context
             self.logger.log_metrics(
                 {
                     "generated_text": Html(
-                        f"<p><b>Context:</b> {self.config.training.start_context}</p>"
+                        f"<p><b>Context:</b> {context}</p>"
                         f"<p><b>Generated:</b> {generated_text}</p>"
                     )
                 },

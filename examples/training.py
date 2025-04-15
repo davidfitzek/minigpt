@@ -7,6 +7,7 @@ from minigpt.data.dataloader import get_dataloader
 from minigpt.model.transformer import GPTModel
 from minigpt.config.config import MinigptConfig, DEFAULT_CONFIG
 from minigpt.trainer import Trainer
+from minigpt.lightning.gpt_module import GPTLightningModule
 from minigpt.loggers import WandbLogger
 from minigpt.callbacks import ModelCheckpoint
 
@@ -17,24 +18,26 @@ def main(config: MinigptConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ##############################
-    # Initialize model, tokenizer and optimizer
+    # Initialize model components
     ##############################
-
+    # Create the base model
     model = GPTModel(config.model)
-    model.to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-    )
-
+    # Create the tokenizer
     tokenizer = tiktoken.get_encoding("gpt2")
+
+    # Create the Lightning module that wraps the model
+    lightning_module = GPTLightningModule(
+        model=model,
+        tokenizer=tokenizer,
+        learning_rate=config.training.learning_rate,
+        weight_decay=config.training.weight_decay,
+        start_context=config.training.start_context,
+    )
 
     ##############################
     # Set up dataloaders
     ##############################
-
     train_loader, val_loader = get_dataloader(
         version=2,
         data_dir=config.training.data_dir,
@@ -45,7 +48,6 @@ def main(config: MinigptConfig):
     ##############################
     # Logger and Callback
     ##############################
-
     logger = WandbLogger(
         project=config.training.wandb_project,
         name=config.training.wandb_run_name,
@@ -53,28 +55,25 @@ def main(config: MinigptConfig):
 
     # Create a ModelCheckpoint callback
     checkpoint_callback = ModelCheckpoint(
-        dirpath="checkpoints",  # Where to save the checkpoints
-        filename="minigpt_model_{epoch}",  # Checkpoint filename pattern
-        save_freq="epoch",  # Save at the end of each epoch
-        every_n_epochs=1,  # Save every epoch
-        save_best_only=True,  # Only save when the model improves
+        dirpath="checkpoints",
+        # filename="minigpt_model_{epoch}",
+        save_freq="step",
+        every_n_steps=1,
+        save_best_only=True,
         monitor="val_loss",
-        mode="min",  # Lower is better for loss
-        verbose=True,  # Print info when saving
+        mode="min",
+        verbose=True,
     )
 
     ##############################
     # Train model
     ##############################
-
     trainer = Trainer(
-        model=model,
+        lightning_module=lightning_module,
         train_loader=train_loader,
         val_loader=val_loader,
-        optimizer=optimizer,
         device=device,
         config=config,
-        tokenizer=tokenizer,
         logger=logger,
         callbacks=[checkpoint_callback],
     )
